@@ -1,5 +1,5 @@
 [package]
-name = "nav1-truenas"
+name = "nav1-watcher"
 version = "0.1.0"
 edition = "2021"
 
