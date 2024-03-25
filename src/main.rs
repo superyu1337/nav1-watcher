@@ -7,6 +7,7 @@ mod config;
 mod cli;
 mod watcher;
 mod webhook;
+mod show;
 
 fn main() {
     let cli = Cli::parse();

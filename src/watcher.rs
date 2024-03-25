@@ -1,15 +1,16 @@
-use std::{ffi::OsString, path::PathBuf};
+use std::{collections::HashMap, fs::read_dir, path::PathBuf};
 
 use directories::ProjectDirs;
 
-use crate::{config::Config, webhook::{Embed, Field, Footer, Webhook}};
+use crate::{config::Config, show::{Show, ShowComparison}, webhook::{Embed, Field, Footer, Webhook}};
 
 #[derive(Clone, Debug)]
 pub struct Watcher {
     config: Config,
     data_dir: PathBuf,
     no_webhook: bool,
-    directories: Vec<OsString>,
+    /// String is the CLEANED title!
+    shows: HashMap<String, Show>,
 }
 
 impl Watcher {
@@ -25,16 +26,16 @@ impl Watcher {
         if let Some(proj_dirs) = ProjectDirs::from("xyz", "superyu", "nav1truenas") {
             let data_dir = proj_dirs.data_dir().to_path_buf();
 
-            let mut directories = Vec::new();
+            let mut shows = HashMap::new();
 
             if let Ok(dirs_str) = std::fs::read_to_string(data_dir.join(format!("{}.json", config.name()))) {
-                directories = serde_json::from_str(&dirs_str).expect("Failed to serialize directory cache");
+                shows = serde_json::from_str(&dirs_str).expect("Failed to serialize shows cache");
             }
 
             return Watcher {
                 config,
                 data_dir,
-                directories,
+                shows,
                 no_webhook
             }
         }
@@ -42,60 +43,96 @@ impl Watcher {
         panic!("Could not get data directory!");
     }
 
-    fn persist_directories(&self) {
+    fn persist_shows(&self) {
         let persist_directory = self.data_dir.join(format!("{}.json", self.config.name()));
 
         if !self.data_dir.exists() {
             std::fs::create_dir_all(&self.data_dir).expect("Failed to create data directory");
         }
 
-        let directories_str = serde_json::to_string(&self.directories).expect("Failed to serialize directories");
-        std::fs::write(persist_directory, directories_str).expect("Failed to write directory cache");
+        let shows_str = serde_json::to_string(&self.shows).expect("Failed to serialize directories");
+        std::fs::write(persist_directory, shows_str).expect("Failed to write shows cache");
     }
 
-    /// Updates directory cache, returns the name of newly added directories.
-    pub fn update_directories(&mut self) -> Vec<OsString> {
-        let mut new_list = Vec::new();
-        let mut newly_added = Vec::new();
+    pub fn read_new(&mut self) -> HashMap<String, Show> {
+        let mut new = HashMap::new();
 
-        for dir_res in std::fs::read_dir(self.config.watch_folder()).expect("Failed to read directory") {
+        for dir_res in read_dir(self.config.watch_folder()).expect("Fild to read watch directory") {
             if let Ok(dir) = dir_res {
-                if dir.file_type().expect("Failed to get filetype").is_dir() {
-                    let name = dir.file_name();
-
-                    if !self.directories.contains(&name) {
-                        newly_added.push(name.clone());
-                    }
-
-                    new_list.push(name);
+                if dir.file_type().expect("Failed to get file type").is_dir() {
+                    let show = Show::from_folder(&dir.path());
+                    new.insert(show.title().to_owned(), show);
                 }
             }
         }
 
-        self.directories = new_list;
-        self.persist_directories();
-
-        newly_added
+        new
     }
 
-    fn clean_title<'a>(title: &'a str) -> String {
-        let str = title.to_owned();
+    pub fn update_shows(&mut self) -> Vec<Comparison> {
+        let new = self.read_new();
 
-        let re = regex::bytes::Regex::new(r"(\s\[[a-zA-Z]+-\d+\])|(\s\[nAV1])").unwrap();
-        let cleaned = re.replace_all(str.as_bytes(), "".as_bytes());
-        let cleaned_string = String::from_utf8(cleaned.to_vec()).expect("Failed to construct String from bytes");
+        let mut comparisons = new
+            .clone()
+            .into_iter()
+            .map(|(k, v)| {
+                if let Some(other) = self.shows.get(&k) {
+                    v.compare(other)
+                } else {
+                    None
+                }
+            })
+            .filter_map(|f| f)
+            .map(|f| Comparison::Changed(f))
+            .collect::<Vec<Comparison>>();
 
-        cleaned_string
+        let mut new_shows = new
+            .clone()
+            .into_iter()
+            .filter(|(k, _)| !self.shows.contains_key(k))
+            .map(|(_, v)| Comparison::NewlyAdded(v))
+            .collect::<Vec<Comparison>>();
+
+        self.shows = new;
+        self.persist_shows();
+
+        comparisons.append(&mut new_shows);
+        comparisons
     }
 
-    fn fire_webhook<'a>(&self, title: &'a str) {
+    fn fire_webhook<'a>(&self, comp: Comparison) {
         let reqwest = reqwest::blocking::Client::new();
 
         let content = {
+            let msg = match &comp {
+                Comparison::NewlyAdded(_) => {
+                    format!("New show!")
+                },
+                Comparison::Changed(showcomp) => {
+                    match showcomp {
+                        ShowComparison::NewSeasons(_, seasons) => {
+                            if seasons.len() > 1 {
+                                format!("New seasons!")
+                            } else {
+                                format!("New season!")
+                            }
+                        },
+                        ShowComparison::NewEpisodes(_, episodes) => {
+                            if *episodes > 1 {
+                                format!("New episodes!")
+                            } else {
+                                format!("New episode!")
+                            }
+                        },
+                        
+                    }
+                },
+            };
+
             if let Some(role) = self.config.role_ping_id() {
-                format!("<@&{role}> New upload!")
+                format!("<@&{role}> {msg}")
             } else {
-                format!("New upload!")
+                format!("{msg}")
             }
         };
 
@@ -107,11 +144,95 @@ impl Watcher {
                     Field::builder(
                         String::from("Download"), 
                         link.to_owned()
-                    ).build()
+                    ).inline(true).build()
                 )
             }
 
+            match &comp {
+                Comparison::NewlyAdded(show) => {
+                    fields.push(
+                        Field::builder(
+                            String::from("Episodes"),
+                            format!("{}", show.episode_count())
+                        ).inline(true).build()
+                    )
+                },
+                Comparison::Changed(showcomp) => {
+                    match showcomp {
+                        ShowComparison::NewSeasons(_, seasons) => {
+                            let new_episodes = seasons
+                                .iter()
+                                .fold(0usize, |mut c, s| {
+                                    c += s.episodes();
+                                    c
+                                });
+
+                            fields.push(
+                                Field::builder(
+                                    String::from("New Episodes"),
+                                    format!("{}", new_episodes)
+                                ).inline(true).build()
+                            );
+                        },
+                        ShowComparison::NewEpisodes(_, episodes) => {
+                            if *episodes > 1 {
+                                fields.push(
+                                    Field::builder(
+                                        String::from("New Episodes"),
+                                        format!("{}", episodes)
+                                    ).inline(true).build()
+                                );
+                            }
+                        },
+                    }
+                },
+            }
+
             fields
+        };
+
+        let title = {
+            match &comp {
+                Comparison::NewlyAdded(show) => format!("{}", show.title()),
+                Comparison::Changed(showcomp) => {
+                    match showcomp {
+                        ShowComparison::NewSeasons(show, seasons) => {
+                            if seasons.len() == 1 {
+                                let first = seasons.first().expect("Failed to get first element");
+                                format!(
+                                    "{} (Season {})", 
+                                    show.title(), 
+                                    first.season_number()
+                                )
+                            } else {
+                                let first = seasons.first().expect("Failed to get first element");
+                                let last = seasons.last().expect("Failed to get first element");
+                                format!(
+                                    "{} (Seasons {}-{})",
+                                    show.title(),
+                                    first.season_number(),
+                                    last.season_number()
+                                )
+                            }
+                        },
+                        ShowComparison::NewEpisodes(show, episodes) => {
+                            if *episodes > 1 {
+                                format!(
+                                    "{} (+{} Episodes)",
+                                    show.title(),
+                                    episodes
+                                )
+                            } else {
+                                format!(
+                                    "{} (+{} Episode)",
+                                    show.title(),
+                                    episodes
+                                )
+                            }
+                        },
+                    }
+                },
+            }
         };
 
         let webhook = Webhook::builder()
@@ -129,7 +250,7 @@ impl Watcher {
             .embeds(
                 vec![
                     Embed::builder()
-                        .title(Watcher::clean_title(title))
+                        .title(title)
                         .color(self.config.color())
                         .fields(fields)
                         .footer(
@@ -156,14 +277,18 @@ impl Watcher {
     }
 
     pub fn run(&mut self) {
-        let newly_added = self.update_directories();
+        let comparisons = self.update_shows();
 
         if !self.no_webhook {
-            for title in newly_added {
-                if let Some(str) = title.to_str() {
-                    self.fire_webhook(str)
-                }
+            for comp in comparisons {
+                self.fire_webhook(comp);
             }
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum Comparison {
+    NewlyAdded(Show),
+    Changed(ShowComparison),
 }
